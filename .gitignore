@@ -8,6 +8,15 @@ out-tsc
 .expo
 .expo-shared
 
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Stock notifier runtime state (persisted per-host; do not commit)
+state.json
+
 # dependencies
 node_modules
 

@@ -40,6 +40,13 @@ USER_AGENT = (
 WATCHLIST_PATH = os.environ.get("WATCHLIST_PATH", "watchlist.json")
 DEFAULT_WATCHLIST = ["hotwheels"]
 
+STATE_PATH = os.environ.get("STATE_PATH", "state.json")
+
+# When set, do one scrape across the watchlist and exit (no Telegram
+# command listener, no sleep loop). Designed for cron-style hosts like
+# GitHub Actions.
+RUN_ONCE = os.environ.get("RUN_ONCE", "").strip().lower() in ("1", "true", "yes", "on")
+
 
 # ---------------------------------------------------------------------------
 # Watchlist persistence
@@ -75,6 +82,45 @@ def save_watchlist(items: list[str]) -> None:
             json.dump(items, f, indent=2)
     except Exception as exc:
         logging.error("Failed to save watchlist: %s", exc)
+
+
+def load_state() -> dict:
+    """Load persisted per-keyword state (signatures + checked_at)."""
+    if os.path.exists(STATE_PATH):
+        try:
+            with open(STATE_PATH, "r") as f:
+                data = json.load(f)
+            keywords = data.get("keywords") if isinstance(data, dict) else None
+            if isinstance(keywords, dict):
+                return {
+                    k: {
+                        "signature": v.get("signature") or "",
+                        "checked_at": v.get("checked_at") or "",
+                    }
+                    for k, v in keywords.items()
+                    if isinstance(v, dict)
+                }
+        except Exception as exc:
+            logging.warning("Failed to read %s: %s", STATE_PATH, exc)
+    return {}
+
+
+def save_state(keywords: dict) -> None:
+    """Persist per-keyword signatures so dedup survives restarts."""
+    payload = {
+        "keywords": {
+            k: {
+                "signature": v.get("signature") or "",
+                "checked_at": v.get("checked_at") or "",
+            }
+            for k, v in keywords.items()
+        }
+    }
+    try:
+        with open(STATE_PATH, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as exc:
+        logging.error("Failed to save state: %s", exc)
 
 
 def search_url_for(keyword: str) -> str:
@@ -451,6 +497,10 @@ def run_once(browser, state: dict) -> None:
     finally:
         context.close()
 
+    # Persist state so dedup survives across processes (e.g. GitHub Actions).
+    with state["lock"]:
+        save_state(state["keywords"])
+
 
 # ---------------------------------------------------------------------------
 # Telegram command handling
@@ -681,11 +731,26 @@ def main() -> None:
     watchlist = load_watchlist()
     logging.info("Watchlist (%d): %s", len(watchlist), ", ".join(watchlist))
 
+    persisted = load_state()
+    if persisted:
+        logging.info("Loaded persisted state for %d keyword(s).", len(persisted))
+
     state: dict = {
         "lock": threading.Lock(),
         "watchlist": watchlist,
-        "keywords": {},  # keyword -> {products, checked_at, signature}
+        # keyword -> {signature, checked_at, products?}
+        "keywords": {k: dict(v) for k, v in persisted.items()},
     }
+
+    if RUN_ONCE:
+        logging.info("RUN_ONCE mode: single scrape, then exit (no command listener).")
+        with sync_playwright() as playwright:
+            browser = _launch_browser(playwright)
+            try:
+                run_once(browser, state)
+            finally:
+                browser.close()
+        return
 
     cmd_thread = threading.Thread(
         target=telegram_command_loop, args=(state,), daemon=True, name="telegram-cmd"

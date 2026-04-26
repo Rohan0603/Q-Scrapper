@@ -106,23 +106,60 @@ for an unattended background notifier.
 
 ### GitHub Actions (recommended free option for periodic alerts)
 
-GitHub Actions can run `main.py` on a cron schedule (e.g. every 15
-minutes) for free, indefinitely. The trade-off:
+The repository already includes `.github/workflows/check.yml`, which
+runs `main.py` on a cron schedule (every ~15 minutes) for free,
+indefinitely. The trade-off:
 
 - ✅ **Periodic stock-change alerts** — fully supported.
 - ❌ **Interactive `/status`, `/watch`, `/unwatch` commands** — won't work,
-  because GHA only runs on a schedule, not continuously.
+  because GHA only runs on a schedule, not continuously. Edit
+  `watchlist.json` in the repo and commit to change what's tracked.
 
-To make this script GHA-friendly we'd need to:
-1. Add a "run once then exit" mode so the cron job doesn't loop forever.
-2. Persist `watchlist.json` and the dedup signatures between runs (via
-   `actions/cache` or by committing them back to the repo) so we don't
-   re-send the same alert every cron tick.
-3. Add `.github/workflows/check.yml` with a `schedule:` trigger and the
-   two Telegram secrets as repository secrets.
+#### One-time setup
 
-If you'd like, ask the agent to wire this up — it's a small refactor
-plus one workflow file.
+1. **Push this code to a GitHub repository** (it can be private).
+
+2. **Add Telegram secrets** under
+   *Settings → Secrets and variables → Actions → New repository secret*:
+   - `TELEGRAM_BOT_TOKEN`
+   - `TELEGRAM_CHAT_ID`
+
+3. *(Optional)* **Add location overrides** as repository **variables**
+   (same screen, different tab) if you need a non-default location:
+   `BLINKIT_LAT`, `BLINKIT_LON`, `BLINKIT_LOCALITY`, `BLINKIT_LANDMARK`,
+   `BLINKIT_CITY`, `BLINKIT_STATE`. Skip this if Whitefield, Bengaluru
+   is fine.
+
+4. **Enable Actions** for the repo (Actions tab → enable workflows).
+   The first scheduled run will fire within ~15 min; you can also click
+   *"Run workflow"* on the Actions tab to trigger it manually right
+   away.
+
+#### How it stays sane
+
+- **`RUN_ONCE=1`** environment variable makes `main.py` do one scrape
+  across the entire watchlist and then exit, instead of running forever.
+- **`state.json`** holds a signature of the last seen results per
+  keyword. The workflow restores this from the GitHub Actions cache at
+  the start of each run and saves it back at the end. Telegram alerts
+  fire only when the signature changes, so you won't be re-pinged every
+  15 minutes for the same listings.
+- **`watchlist.json`** lives in the repo — to add/remove keywords, just
+  edit and commit. (The Telegram `/watch` command isn't usable on GHA.)
+- **`concurrency: stock-check`** prevents overlapping runs from
+  duplicating alerts.
+
+#### Caveats
+
+- GitHub's cron schedules are best-effort — runs can be delayed by a few
+  minutes during peak load. For 15-minute granularity this is fine.
+- Each run typically completes in ~1 minute (Chromium install is cached
+  after the first run). Public repos get unlimited Actions minutes;
+  private repos get 2,000 free minutes/month, which is well within
+  budget.
+- Cache entries expire after 7 days of no access. With a 15-min
+  schedule that never happens, but the worst case if it does is one
+  duplicate alert.
 
 ### Oracle Cloud Always-Free VM
 
