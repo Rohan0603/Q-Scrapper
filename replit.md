@@ -25,3 +25,13 @@ pnpm workspace monorepo using TypeScript. Each package manages its own dependenc
 - `pnpm --filter @workspace/api-server run dev` — run API server locally
 
 See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details.
+
+## Blinkit Hotwheels Stock Notifier (Python)
+
+A standalone Python script at the project root that watches Blinkit for Hot Wheels availability and pushes Telegram alerts.
+
+- **Entrypoint**: `main.py` (run by the `Stock Notifier` workflow as `python -u main.py`)
+- **Dependencies**: `requirements.txt` — `requests`, `beautifulsoup4`, `python-telegram-bot`, `playwright` (uses system Chromium installed via Nix)
+- **Required secrets**: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+- **Optional env vars**: `HOTWHEELS_SEARCH_URL`, `CHECK_INTERVAL` (seconds, default 600), `BLINKIT_LAT`, `BLINKIT_LON`, `BLINKIT_LOCALITY`, `BLINKIT_LANDMARK`, `BLINKIT_CITY`, `BLINKIT_STATE` — used to set Blinkit's location cookies so the search returns real product listings
+- Notifies once per unique product (name + quantity + price). When a product goes out of stock and back in, it will notify again.
