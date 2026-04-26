@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+python-telegram-bot
+beautifulsoup4
+python-telegram-bot
+requests
