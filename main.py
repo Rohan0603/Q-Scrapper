@@ -37,8 +37,8 @@ def _env(name: str, default: str) -> str:
 
 CHECK_INTERVAL = int(_env("CHECK_INTERVAL", "600"))
 
-LOCATION_LAT = float(_env("BLINKIT_LAT", "12.9784"))
-LOCATION_LON = float(_env("BLINKIT_LON", "77.7506"))
+LOCATION_LAT = float(_env("BLINKIT_LAT", "12.9807"))  # 12°58'50.5"N
+LOCATION_LON = float(_env("BLINKIT_LON", "77.7465"))  # 77°44'47.3"E
 LOCATION_LOCALITY = _env("BLINKIT_LOCALITY", "Pattandur Agrahara")
 LOCATION_LANDMARK = _env("BLINKIT_LANDMARK", "Whitefield")
 LOCATION_CITY = _env("BLINKIT_CITY", "Bengaluru")
