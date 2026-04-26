@@ -16,6 +16,7 @@ venv/
 
 # Stock notifier runtime state (persisted per-host; do not commit)
 state.json
+debug/
 
 # dependencies
 node_modules

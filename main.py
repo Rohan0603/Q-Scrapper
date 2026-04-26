@@ -323,9 +323,8 @@ BLINKIT_EXTRACT_PRODUCTS_JS_TEMPLATE_V2 = r"""
   const normalize = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const targetNorm = normalize(KEYWORD);
 
-  const RUPEE = '\\u20b9';
+  const PRICE_RE = /(?:₹|rs\.?)\s*([0-9][0-9,]*)/i;
   const LEGACY_RUPEE = '\\u00e2\\u201a\\u00b9'; // "â‚¹" seen in some logs/encodings
-  const PRICE_RE = new RegExp('(?:' + RUPEE + '|' + LEGACY_RUPEE + '|rs\\\\.?)\\\\s*([0-9][0-9,]*)', 'i');
   const QTY_RE = /\\b(\\d+\\s*(?:pcs|pc|pack|unit|units|g|kg|ml|l))\\b/i;
   const SKIP_RE = /^(showing\\s+results?|search\\s+results?|showing\\s+related)/i;
 
@@ -336,7 +335,7 @@ BLINKIT_EXTRACT_PRODUCTS_JS_TEMPLATE_V2 = r"""
   const isProductImage = (im) => {
     const src = im.currentSrc || im.src || im.getAttribute('data-src') || '';
     if (!src) return false;
-    if (/\\/(eta-icons|icons|badges|store-icons|brand-images?)\\//i.test(src)) return false;
+    if (/\/(eta-icons|icons|badges|store-icons|brand-images?)\//i.test(src)) return false;
     if ((im.naturalWidth && im.naturalWidth < 40) || (im.width && im.width < 40)) return false;
     return true;
   };
@@ -431,7 +430,7 @@ GENERIC_EXTRACT_PRODUCTS_JS_TEMPLATE = r"""
   const isProductImage = (im) => {
     const src = im.currentSrc || im.src || im.getAttribute('data-src') || '';
     if (!src) return false;
-    if (/\\/(icons?|badges|store-icons|brand-images?)\\//i.test(src)) return false;
+    if (/\/(icons?|badges|store-icons|brand-images?)\//i.test(src)) return false;
     if ((im.naturalWidth && im.naturalWidth < 40) || (im.width && im.width < 40)) return false;
     return true;
   };
