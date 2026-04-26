@@ -1,16 +1,20 @@
-"""Blinkit Hotwheels Stock Notifier (Playwright edition).
+"""Blinkit Stock Notifier (Playwright edition).
 
-Loads Blinkit search results for "hotwheels" with the user's location set,
-extracts every Hot Wheels product card from the rendered DOM, and sends a
-Telegram message the first time each product is detected in stock.
+Watches Blinkit search results for a configurable list of keywords (the
+"watchlist") with the user's location set, extracts every matching product
+card from the rendered DOM, and sends Telegram messages whenever the stock
+status of any product changes. Also supports interactive commands over
+Telegram (/status, /watch, /unwatch, /list, /help).
 """
 
 import json
 import logging
 import os
+import re
 import shutil
 import threading
 import time
+import urllib.parse
 from datetime import datetime
 
 import requests
@@ -19,9 +23,6 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-HOTWHEELS_SEARCH_URL = os.environ.get(
-    "HOTWHEELS_SEARCH_URL", "https://www.blinkit.com/s/?q=hotwheels"
-)
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "600"))
 
 LOCATION_LAT = float(os.environ.get("BLINKIT_LAT", "12.9784"))
@@ -36,33 +37,83 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 )
 
-EXTRACT_PRODUCTS_JS = r"""
-() => {
+WATCHLIST_PATH = os.environ.get("WATCHLIST_PATH", "watchlist.json")
+DEFAULT_WATCHLIST = ["hotwheels"]
+
+
+# ---------------------------------------------------------------------------
+# Watchlist persistence
+# ---------------------------------------------------------------------------
+
+def _normalize_keyword(kw: str) -> str:
+    """Canonical form used for matching/dedup; preserves spaces for display."""
+    return " ".join((kw or "").lower().split())
+
+
+def load_watchlist() -> list[str]:
+    if os.path.exists(WATCHLIST_PATH):
+        try:
+            with open(WATCHLIST_PATH, "r") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                cleaned = []
+                seen = set()
+                for x in data:
+                    n = _normalize_keyword(str(x))
+                    if n and n not in seen:
+                        seen.add(n)
+                        cleaned.append(n)
+                return cleaned or list(DEFAULT_WATCHLIST)
+        except Exception as exc:
+            logging.warning("Failed to read %s: %s", WATCHLIST_PATH, exc)
+    return list(DEFAULT_WATCHLIST)
+
+
+def save_watchlist(items: list[str]) -> None:
+    try:
+        with open(WATCHLIST_PATH, "w") as f:
+            json.dump(items, f, indent=2)
+    except Exception as exc:
+        logging.error("Failed to save watchlist: %s", exc)
+
+
+def search_url_for(keyword: str) -> str:
+    return "https://www.blinkit.com/s/?q=" + urllib.parse.quote(keyword)
+
+
+# ---------------------------------------------------------------------------
+# Browser-side extraction
+# ---------------------------------------------------------------------------
+
+EXTRACT_PRODUCTS_JS_TEMPLATE = r"""
+(() => {
+  const KEYWORD = __KEYWORD__;
+  const normalize = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const targetNorm = normalize(KEYWORD);
+
   const titles = document.querySelectorAll('.tw-line-clamp-2');
   const items = [];
   const seen = new Set();
-  const HOTWHEELS_RE = /hot[\s-]?wheels/i;
-  // Header / breadcrumb patterns to ignore.
   const SKIP_RE = /^(showing\s+results?|search\s+results?|showing\s+related)/i;
+
+  const isProductImage = (im) => {
+    const src = im.currentSrc || im.src || im.getAttribute('data-src') || '';
+    if (!src) return false;
+    if (/\/(eta-icons|icons|badges|store-icons|brand-images?)\//i.test(src)) return false;
+    if ((im.naturalWidth && im.naturalWidth < 40) || (im.width && im.width < 40)) return false;
+    return true;
+  };
 
   for (const t of titles) {
     const name = (t.textContent || '').trim();
-    if (!name || name.length < 5) continue;
+    if (!name || name.length < 3) continue;
     if (SKIP_RE.test(name)) continue;
-    if (!HOTWHEELS_RE.test(name)) continue;
+    if (!normalize(name).includes(targetNorm)) continue;
 
-    // Walk up until we find the smallest ancestor that contains BOTH
-    // a [role="button"] (ADD/Notify Me) AND a product image (not an
-    // eta/icon helper graphic). The button is in a deeper wrapper than
-    // the image on Blinkit, so we have to keep climbing.
-    const isProductImage = (im) => {
-      const src = im.currentSrc || im.src || im.getAttribute('data-src') || '';
-      if (!src) return false;
-      if (/\/(eta-icons|icons|badges|store-icons|brand-images?)\//i.test(src)) return false;
-      // Tiny rendered images are decorative.
-      if ((im.naturalWidth && im.naturalWidth < 40) || (im.width && im.width < 40)) return false;
-      return true;
-    };
+    // Walk up until we find the smallest ancestor that contains BOTH a
+    // [role="button"] (ADD/Notify Me) AND a product image (not an
+    // eta/icon helper graphic). Falls back to the first ancestor with a
+    // button if no image is available.
     let card = t;
     let cardEl = null;
     for (let i = 0; i < 20; i++) {
@@ -73,7 +124,6 @@ EXTRACT_PRODUCTS_JS = r"""
       if (productImg) { cardEl = card; break; }
     }
     if (!cardEl) {
-      // Fallback: any ancestor with a button (image-less card).
       let c = t;
       for (let i = 0; i < 15; i++) {
         if (!c.parentElement) break;
@@ -85,9 +135,8 @@ EXTRACT_PRODUCTS_JS = r"""
     card = cardEl;
 
     const cardText = (card.textContent || '').replace(/\s+/g, ' ').trim();
-    if (!/₹/.test(cardText)) continue;  // Must look like a product card.
+    if (!/₹/.test(cardText)) continue;
 
-    // Stock detection: prefer button label, fall back to card text.
     const buttons = card.querySelectorAll('[role="button"]');
     let buttonLabel = '';
     for (const b of buttons) {
@@ -109,7 +158,6 @@ EXTRACT_PRODUCTS_JS = r"""
     const qtyMatch = cardText.match(/\b(\d+\s*(?:pcs|pc|pack|unit|units|g|kg|ml|l))\b/i);
     const quantity = qtyMatch ? qtyMatch[1] : '';
 
-    // Extract product image URL (skip eta/icon helper graphics).
     let image = '';
     const productImg = Array.from(card.querySelectorAll('img')).find(isProductImage);
     if (productImg) {
@@ -126,9 +174,17 @@ EXTRACT_PRODUCTS_JS = r"""
     items.push({ name, price, quantity, inStock, outOfStock, buttonLabel, image });
   }
   return items;
-}
+})()
 """
 
+
+def _extraction_js(keyword: str) -> str:
+    return EXTRACT_PRODUCTS_JS_TEMPLATE.replace("__KEYWORD__", json.dumps(keyword))
+
+
+# ---------------------------------------------------------------------------
+# Telegram helpers
+# ---------------------------------------------------------------------------
 
 def _telegram_api(method: str) -> str:
     return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
@@ -164,7 +220,6 @@ def send_telegram_media_group(
             entry = {"type": "photo", "media": it["image"]}
             cap = it.get("caption", "")
             if cap:
-                # Telegram caption limit is 1024 characters.
                 entry["caption"] = cap[:1024]
             media.append(entry)
         try:
@@ -185,6 +240,10 @@ def send_telegram_media_group(
                     (it.get("caption") or "") + "\n" + it["image"], chat_id=target
                 )
 
+
+# ---------------------------------------------------------------------------
+# Browser
+# ---------------------------------------------------------------------------
 
 def _launch_browser(playwright):
     chromium_path = shutil.which("chromium") or shutil.which("chromium-browser")
@@ -228,41 +287,44 @@ def _autoscroll(page, steps: int = 10, delay_ms: int = 600) -> None:
         page.wait_for_timeout(delay_ms)
 
 
-def get_hotwheels_products(page) -> list[dict]:
+def get_products(page, keyword: str) -> list[dict]:
+    url = search_url_for(keyword)
     try:
-        page.goto(HOTWHEELS_SEARCH_URL, wait_until="domcontentloaded", timeout=30000)
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
     except PWTimeout:
-        logging.warning("Search page timed out on initial load; continuing.")
+        logging.warning("[%s] search page timed out on initial load; continuing.", keyword)
     page.wait_for_timeout(4000)
-    # Wait for product cards (any ADD button) to appear before scrolling.
     try:
         page.wait_for_function(
             "document.body && document.body.innerText.includes('ADD')",
             timeout=15000,
         )
     except PWTimeout:
-        logging.warning("No ADD buttons appeared within 15s; continuing anyway.")
+        logging.warning("[%s] no ADD buttons appeared within 15s; continuing.", keyword)
 
     _autoscroll(page)
-    # Scroll back to the top so all cards have rendered their interactive bits.
     page.evaluate("window.scrollTo(0, 0)")
     page.wait_for_timeout(1500)
 
     try:
-        products = page.evaluate(EXTRACT_PRODUCTS_JS)
+        products = page.evaluate(_extraction_js(keyword))
     except Exception as exc:
-        logging.error("Failed to extract products: %s", exc)
+        logging.error("[%s] failed to extract products: %s", keyword, exc)
         return []
 
     if not products:
         body_text = page.inner_text("body").lower()
         if "select your location" in body_text or "detect my location" in body_text:
             logging.warning(
-                "Blinkit is asking for a delivery location. Location cookies "
-                "may not have taken effect."
+                "[%s] Blinkit is asking for a delivery location. Location "
+                "cookies may not have taken effect.", keyword,
             )
     return products
 
+
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
 
 def _status_label(product: dict) -> str:
     if product.get("inStock"):
@@ -291,15 +353,19 @@ def _ordered_products(products: list[dict]) -> list[dict]:
     )
 
 
-def _build_summary(products: list[dict], checked_at: str | None = None) -> str:
+def _build_summary(
+    keyword: str,
+    products: list[dict],
+    checked_at: str | None = None,
+) -> str:
     location = f"{LOCATION_LANDMARK}, {LOCATION_CITY} ({LOCATION_LAT}, {LOCATION_LON})"
-    header = f"Hot Wheels stock @ {location}"
+    header = f"\"{keyword}\" stock @ {location}"
     if checked_at:
         header += f"\nChecked: {checked_at}"
     if not products:
-        return header + "\n(no Hot Wheels products found)"
+        return header + f"\n(no \"{keyword}\" products found)\n{search_url_for(keyword)}"
     lines = [_format_product_line(p) for p in _ordered_products(products)]
-    return header + "\n" + "\n".join(lines) + f"\n{HOTWHEELS_SEARCH_URL}"
+    return header + "\n" + "\n".join(lines) + f"\n{search_url_for(keyword)}"
 
 
 def _build_media_items(products: list[dict]) -> list[dict]:
@@ -313,7 +379,6 @@ def _build_media_items(products: list[dict]) -> list[dict]:
 
 
 def _summary_signature(products: list[dict]) -> str:
-    """A stable string that changes whenever any product's stock status changes."""
     rows = []
     for p in products:
         rows.append(
@@ -328,56 +393,229 @@ def _summary_signature(products: list[dict]) -> str:
     return "\n".join(rows)
 
 
-def _send_full_report(products: list[dict], checked_at: str, chat_id: str | None = None) -> None:
-    summary = _build_summary(products, checked_at=checked_at)
+def _send_full_report(
+    keyword: str,
+    products: list[dict],
+    checked_at: str,
+    chat_id: str | None = None,
+) -> None:
+    summary = _build_summary(keyword, products, checked_at=checked_at)
     send_telegram_message(summary, chat_id=chat_id)
     media = _build_media_items(products)
     if media:
         send_telegram_media_group(media, chat_id=chat_id)
 
 
+# ---------------------------------------------------------------------------
+# Scrape loop
+# ---------------------------------------------------------------------------
+
 def run_once(browser, state: dict) -> None:
+    with state["lock"]:
+        keywords = list(state["watchlist"])
+    if not keywords:
+        logging.info("Watchlist is empty; nothing to scrape.")
+        return
+
     context = _new_context(browser)
     page = context.new_page()
     try:
-        products = get_hotwheels_products(page)
-        logging.info("Found %d Hot Wheels product(s).", len(products))
-        for product in products:
-            logging.info(_format_product_line(product))
+        for keyword in keywords:
+            try:
+                products = get_products(page, keyword)
+            except Exception as exc:
+                logging.error("[%s] scrape failed: %s", keyword, exc)
+                continue
 
-        checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        signature = _summary_signature(products)
+            logging.info("[%s] found %d product(s).", keyword, len(products))
+            for product in products:
+                logging.info("  %s", _format_product_line(product))
 
-        # Cache for /status command.
-        state["products"] = products
-        state["checked_at"] = checked_at
+            checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            signature = _summary_signature(products)
 
-        if signature != state.get("signature"):
-            _send_full_report(products, checked_at)
-            state["signature"] = signature
-            logging.info("Stock status changed — Telegram report sent.")
-        else:
-            logging.info("No stock changes since last check; skipping Telegram.")
+            with state["lock"]:
+                prev = state["keywords"].get(keyword, {})
+                state["keywords"][keyword] = {
+                    "products": products,
+                    "checked_at": checked_at,
+                    "signature": signature,
+                }
+                changed = signature != prev.get("signature")
+
+            if changed:
+                _send_full_report(keyword, products, checked_at)
+                logging.info("[%s] stock status changed — Telegram report sent.", keyword)
+            else:
+                logging.info("[%s] no stock changes; skipping Telegram.", keyword)
     finally:
         context.close()
 
 
-def telegram_command_loop(state: dict) -> None:
-    """Background thread: long-poll Telegram for /status commands."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.warning("Telegram credentials missing; /status command disabled.")
+# ---------------------------------------------------------------------------
+# Telegram command handling
+# ---------------------------------------------------------------------------
+
+HELP_TEXT = (
+    "Blinkit Stock Notifier\n"
+    "Commands:\n"
+    "  /status            — show the latest report for every keyword\n"
+    "  /status <keyword>  — show the latest report for one keyword\n"
+    "  /watch <keyword>   — start watching a keyword\n"
+    "  /unwatch <keyword> — stop watching a keyword\n"
+    "  /list              — show your current watchlist\n"
+    "  /help              — show this help"
+)
+
+
+def _parse_argument(text: str) -> str:
+    """Return the part after the command word, normalized."""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        return ""
+    return _normalize_keyword(parts[1])
+
+
+def handle_status_command(state: dict, chat_id: str, arg: str = "") -> None:
+    with state["lock"]:
+        watchlist = list(state["watchlist"])
+        keyword_state = {k: dict(v) for k, v in state["keywords"].items()}
+
+    targets = []
+    if arg:
+        # Match against current watchlist (or any cached keyword) by exact
+        # normalized form.
+        if arg in watchlist or arg in keyword_state:
+            targets = [arg]
+        else:
+            send_telegram_message(
+                f"Not watching \"{arg}\". Use /watch {arg} to add it, or /list to "
+                f"see what's being watched.",
+                chat_id=chat_id,
+            )
+            return
+    else:
+        targets = watchlist or list(keyword_state.keys())
+
+    if not targets:
+        send_telegram_message(
+            "Watchlist is empty. Use /watch <keyword> to start tracking something.",
+            chat_id=chat_id,
+        )
         return
 
-    # Make sure no webhook is set (otherwise getUpdates is rejected).
+    pending = []
+    for kw in targets:
+        data = keyword_state.get(kw)
+        if not data:
+            pending.append(kw)
+            continue
+        logging.info("/status requested for %r — sending cached report.", kw)
+        _send_full_report(
+            kw, data.get("products") or [],
+            checked_at=data.get("checked_at") or "unknown",
+            chat_id=chat_id,
+        )
+
+    if pending:
+        send_telegram_message(
+            "No data yet for: " + ", ".join(f'"{k}"' for k in pending)
+            + ". The next check will populate it.",
+            chat_id=chat_id,
+        )
+
+
+def handle_watch_command(state: dict, chat_id: str, arg: str) -> None:
+    if not arg:
+        send_telegram_message(
+            "Usage: /watch <keyword>\nExample: /watch lego",
+            chat_id=chat_id,
+        )
+        return
+    if not re.search(r"[a-z0-9]", arg):
+        send_telegram_message(
+            f"Keyword \"{arg}\" doesn't look searchable.",
+            chat_id=chat_id,
+        )
+        return
+    with state["lock"]:
+        if arg in state["watchlist"]:
+            send_telegram_message(
+                f"Already watching \"{arg}\".", chat_id=chat_id,
+            )
+            return
+        state["watchlist"].append(arg)
+        save_watchlist(state["watchlist"])
+        count = len(state["watchlist"])
+    send_telegram_message(
+        f"Now watching \"{arg}\" ({count} keyword{'s' if count != 1 else ''} total). "
+        f"It'll appear in the next check, or use /status {arg} after the cycle.",
+        chat_id=chat_id,
+    )
+    logging.info("Added %r to watchlist (now %d).", arg, count)
+
+
+def handle_unwatch_command(state: dict, chat_id: str, arg: str) -> None:
+    if not arg:
+        send_telegram_message(
+            "Usage: /unwatch <keyword>\nUse /list to see what's being watched.",
+            chat_id=chat_id,
+        )
+        return
+    with state["lock"]:
+        if arg not in state["watchlist"]:
+            send_telegram_message(
+                f"Not watching \"{arg}\". Use /list to see what's being watched.",
+                chat_id=chat_id,
+            )
+            return
+        state["watchlist"].remove(arg)
+        state["keywords"].pop(arg, None)
+        save_watchlist(state["watchlist"])
+        count = len(state["watchlist"])
+    send_telegram_message(
+        f"Stopped watching \"{arg}\". {count} keyword{'s' if count != 1 else ''} left.",
+        chat_id=chat_id,
+    )
+    logging.info("Removed %r from watchlist (now %d).", arg, count)
+
+
+def handle_list_command(state: dict, chat_id: str) -> None:
+    with state["lock"]:
+        items = list(state["watchlist"])
+    if not items:
+        send_telegram_message(
+            "Watchlist is empty. Use /watch <keyword> to add one.",
+            chat_id=chat_id,
+        )
+        return
+    send_telegram_message(
+        "Watching:\n" + "\n".join(f"  • {k}" for k in items),
+        chat_id=chat_id,
+    )
+
+
+def telegram_command_loop(state: dict) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.warning("Telegram credentials missing; commands disabled.")
+        return
+
     try:
-        requests.post(_telegram_api("deleteWebhook"), data={"drop_pending_updates": "false"}, timeout=10)
+        requests.post(
+            _telegram_api("deleteWebhook"),
+            data={"drop_pending_updates": "false"},
+            timeout=10,
+        )
     except Exception as exc:
         logging.warning("deleteWebhook failed (continuing): %s", exc)
 
-    # Skip backlog: only react to messages that arrive after startup.
     offset = None
     try:
-        r = requests.get(_telegram_api("getUpdates"), params={"timeout": 0, "offset": -1}, timeout=15)
+        r = requests.get(
+            _telegram_api("getUpdates"),
+            params={"timeout": 0, "offset": -1},
+            timeout=15,
+        )
         last = r.json().get("result", [])
         if last:
             offset = last[-1]["update_id"] + 1
@@ -401,20 +639,21 @@ def telegram_command_loop(state: dict) -> None:
                 chat_id = chat.get("id")
                 if not text or chat_id is None:
                     continue
-                # Only respond to the configured chat.
                 if str(chat_id) != str(TELEGRAM_CHAT_ID):
                     logging.info("Ignoring message from unauthorized chat %s.", chat_id)
                     continue
                 command = text.split()[0].lower().split("@")[0]
+                arg = _parse_argument(text)
                 if command == "/status":
-                    handle_status_command(state, chat_id=str(chat_id))
-                elif command == "/start" or command == "/help":
-                    send_telegram_message(
-                        "Hot Wheels stock notifier.\n"
-                        "Commands:\n"
-                        "  /status — show the latest stock report",
-                        chat_id=str(chat_id),
-                    )
+                    handle_status_command(state, chat_id=str(chat_id), arg=arg)
+                elif command == "/watch":
+                    handle_watch_command(state, chat_id=str(chat_id), arg=arg)
+                elif command == "/unwatch":
+                    handle_unwatch_command(state, chat_id=str(chat_id), arg=arg)
+                elif command in ("/list", "/watchlist"):
+                    handle_list_command(state, chat_id=str(chat_id))
+                elif command in ("/start", "/help"):
+                    send_telegram_message(HELP_TEXT, chat_id=str(chat_id))
         except requests.exceptions.ReadTimeout:
             continue
         except Exception as exc:
@@ -422,25 +661,16 @@ def telegram_command_loop(state: dict) -> None:
             time.sleep(5)
 
 
-def handle_status_command(state: dict, chat_id: str) -> None:
-    products = state.get("products")
-    checked_at = state.get("checked_at")
-    if products is None:
-        send_telegram_message(
-            "Still running the first stock check, please try /status again in a minute.",
-            chat_id=chat_id,
-        )
-        return
-    logging.info("/status requested — sending cached report.")
-    _send_full_report(products, checked_at=checked_at or "unknown", chat_id=chat_id)
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    logging.info("Blinkit Hotwheels Stock Notifier (Playwright) started.")
+    logging.info("Blinkit Stock Notifier (Playwright) started.")
     logging.info(
         "Location: %s, %s, %s (%.4f, %.4f)",
         LOCATION_LANDMARK, LOCATION_LOCALITY, LOCATION_CITY,
@@ -448,7 +678,14 @@ def main() -> None:
     )
     logging.info("Check interval: %d seconds", CHECK_INTERVAL)
 
-    state: dict = {"signature": None, "products": None, "checked_at": None}
+    watchlist = load_watchlist()
+    logging.info("Watchlist (%d): %s", len(watchlist), ", ".join(watchlist))
+
+    state: dict = {
+        "lock": threading.Lock(),
+        "watchlist": watchlist,
+        "keywords": {},  # keyword -> {products, checked_at, signature}
+    }
 
     cmd_thread = threading.Thread(
         target=telegram_command_loop, args=(state,), daemon=True, name="telegram-cmd"
