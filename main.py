@@ -189,41 +189,76 @@ def get_hotwheels_products(page) -> list[dict]:
     return products
 
 
-def run_once(browser, notified: set[str]) -> None:
+def _format_product_line(product: dict) -> str:
+    name = product.get("name", "").strip()
+    price = product.get("price", "")
+    quantity = product.get("quantity", "")
+    in_stock = bool(product.get("inStock"))
+    out_of_stock = bool(product.get("outOfStock"))
+
+    if in_stock:
+        status = "IN STOCK"
+    elif out_of_stock:
+        status = "OUT OF STOCK"
+    else:
+        status = "UNKNOWN"
+
+    parts = [name]
+    if quantity:
+        parts.append(quantity)
+    if price:
+        parts.append(price)
+    return f"[{status}] " + " — ".join(parts)
+
+
+def _build_summary(products: list[dict]) -> str:
+    location = f"{LOCATION_LANDMARK}, {LOCATION_CITY} ({LOCATION_LAT}, {LOCATION_LON})"
+    header = f"Hot Wheels stock @ {location}"
+    if not products:
+        return header + "\n(no Hot Wheels products found)"
+    # Sort: in-stock first, then by name.
+    ordered = sorted(
+        products,
+        key=lambda p: (0 if p.get("inStock") else 1, p.get("name", "")),
+    )
+    lines = [_format_product_line(p) for p in ordered]
+    return header + "\n" + "\n".join(lines) + f"\n{HOTWHEELS_SEARCH_URL}"
+
+
+def _summary_signature(products: list[dict]) -> str:
+    """A stable string that changes whenever any product's stock status changes."""
+    rows = []
+    for p in products:
+        rows.append(
+            "|".join([
+                p.get("name", ""),
+                p.get("quantity", ""),
+                p.get("price", ""),
+                "1" if p.get("inStock") else ("0" if p.get("outOfStock") else "?"),
+            ])
+        )
+    rows.sort()
+    return "\n".join(rows)
+
+
+def run_once(browser, state: dict) -> None:
     context = _new_context(browser)
     page = context.new_page()
     try:
         products = get_hotwheels_products(page)
         logging.info("Found %d Hot Wheels product(s).", len(products))
         for product in products:
-            name = product.get("name", "").strip()
-            price = product.get("price", "")
-            quantity = product.get("quantity", "")
-            in_stock = bool(product.get("inStock"))
-            label_parts = [name]
-            if quantity:
-                label_parts.append(quantity)
-            if price:
-                label_parts.append(price)
-            label = " — ".join(label_parts)
-            button_label = product.get("buttonLabel", "")
+            logging.info(_format_product_line(product))
 
-            key = f"{name}|{quantity}|{price}"
-            if in_stock:
-                if key in notified:
-                    logging.info("Still in stock (already notified): %s", label)
-                else:
-                    msg = (
-                        "Hot Wheels in stock on Blinkit!\n"
-                        f"{label}\n{HOTWHEELS_SEARCH_URL}"
-                    )
-                    send_telegram_message(msg)
-                    notified.add(key)
-                    logging.info("In stock (notified): %s", label)
-            else:
-                logging.info("Not in stock [%s]: %s", button_label or "?", label)
-                # Allow re-notification next time it comes back in stock.
-                notified.discard(key)
+        signature = _summary_signature(products)
+        summary = _build_summary(products)
+
+        if signature != state.get("signature"):
+            send_telegram_message(summary)
+            state["signature"] = signature
+            logging.info("Stock status changed — Telegram summary sent.")
+        else:
+            logging.info("No stock changes since last check; skipping Telegram.")
     finally:
         context.close()
 
@@ -241,13 +276,13 @@ def main() -> None:
     )
     logging.info("Check interval: %d seconds", CHECK_INTERVAL)
 
-    notified: set[str] = set()
+    state: dict = {"signature": None}
     with sync_playwright() as playwright:
         browser = _launch_browser(playwright)
         try:
             while True:
                 try:
-                    run_once(browser, notified)
+                    run_once(browser, state)
                 except Exception as exc:
                     logging.error("Run failed: %s", exc)
                 logging.info("Sleeping %d seconds before next check...", CHECK_INTERVAL)
