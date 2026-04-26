@@ -34,4 +34,5 @@ A standalone Python script at the project root that watches Blinkit for Hot Whee
 - **Dependencies**: `requirements.txt` — `requests`, `beautifulsoup4`, `python-telegram-bot`, `playwright` (uses system Chromium installed via Nix)
 - **Required secrets**: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 - **Optional env vars**: `HOTWHEELS_SEARCH_URL`, `CHECK_INTERVAL` (seconds, default 600), `BLINKIT_LAT`, `BLINKIT_LON`, `BLINKIT_LOCALITY`, `BLINKIT_LANDMARK`, `BLINKIT_CITY`, `BLINKIT_STATE` — used to set Blinkit's location cookies so the search returns real product listings
-- Notifies once per unique product (name + quantity + price). When a product goes out of stock and back in, it will notify again.
+- Each check sends a single Telegram **summary message** listing every Hot Wheels product with `[IN STOCK]` / `[OUT OF STOCK]` status, name, qty, and price, followed by a **media group** of product images (each captioned with the same line). Re-sends only when any product's stock status, set, or price changes (deduplicated via a status fingerprint).
+- Listens for the `/status` Telegram command (long-polling `getUpdates` in a background thread) and replies with the latest cached report (text + photos). Only responds to the configured `TELEGRAM_CHAT_ID`. Also handles `/start` and `/help`.
