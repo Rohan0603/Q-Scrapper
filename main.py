@@ -23,14 +23,26 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "600"))
+def _env(name: str, default: str) -> str:
+    """Like os.environ.get, but treats empty/whitespace as unset.
 
-LOCATION_LAT = float(os.environ.get("BLINKIT_LAT", "12.9784"))
-LOCATION_LON = float(os.environ.get("BLINKIT_LON", "77.7506"))
-LOCATION_LOCALITY = os.environ.get("BLINKIT_LOCALITY", "Pattandur Agrahara")
-LOCATION_LANDMARK = os.environ.get("BLINKIT_LANDMARK", "Whitefield")
-LOCATION_CITY = os.environ.get("BLINKIT_CITY", "Bengaluru")
-LOCATION_STATE = os.environ.get("BLINKIT_STATE", "Karnataka")
+    GitHub Actions expands undefined ${{ vars.X }} to "", which would
+    otherwise crash float() / int() parsing.
+    """
+    val = os.environ.get(name)
+    if val is None or val.strip() == "":
+        return default
+    return val
+
+
+CHECK_INTERVAL = int(_env("CHECK_INTERVAL", "600"))
+
+LOCATION_LAT = float(_env("BLINKIT_LAT", "12.9784"))
+LOCATION_LON = float(_env("BLINKIT_LON", "77.7506"))
+LOCATION_LOCALITY = _env("BLINKIT_LOCALITY", "Pattandur Agrahara")
+LOCATION_LANDMARK = _env("BLINKIT_LANDMARK", "Whitefield")
+LOCATION_CITY = _env("BLINKIT_CITY", "Bengaluru")
+LOCATION_STATE = _env("BLINKIT_STATE", "Karnataka")
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
