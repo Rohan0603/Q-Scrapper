@@ -1,10 +1,12 @@
-"""Blinkit Stock Notifier (Playwright edition).
+"""Multi-store grocery stock notifier (Playwright edition).
 
-Watches Blinkit search results for a configurable list of keywords (the
-"watchlist") with the user's location set, extracts every matching product
-card from the rendered DOM, and sends Telegram messages whenever the stock
-status of any product changes. Also supports interactive commands over
-Telegram (/status, /watch, /unwatch, /list, /help).
+Watches search results across multiple Indian grocery/quick-commerce stores for a
+configurable list of keywords at the user's location, extracts matching product
+cards from the rendered DOM, and sends Telegram messages whenever the stock
+status of any product changes.
+
+Stores supported (best-effort, DOM-dependent): Blinkit, Zepto, Swiggy Instamart,
+BigBasket.
 """
 
 import json
@@ -16,6 +18,7 @@ import threading
 import time
 import urllib.parse
 from datetime import datetime
+from pathlib import Path
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -44,6 +47,15 @@ LOCATION_LANDMARK = _env("BLINKIT_LANDMARK", "Whitefield")
 LOCATION_CITY = _env("BLINKIT_CITY", "Bengaluru")
 LOCATION_STATE = _env("BLINKIT_STATE", "Karnataka")
 
+# Shared location defaults (optionally override via LAT/LON/LOCALITY/LANDMARK/CITY/STATE).
+# If unset, they fall back to the Blinkit defaults above for backward compatibility.
+SHARED_LOCATION_LAT = float(_env("LAT", str(LOCATION_LAT)))
+SHARED_LOCATION_LON = float(_env("LON", str(LOCATION_LON)))
+SHARED_LOCATION_LOCALITY = _env("LOCALITY", LOCATION_LOCALITY)
+SHARED_LOCATION_LANDMARK = _env("LANDMARK", LOCATION_LANDMARK)
+SHARED_LOCATION_CITY = _env("CITY", LOCATION_CITY)
+SHARED_LOCATION_STATE = _env("STATE", LOCATION_STATE)
+
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
@@ -58,6 +70,26 @@ STATE_PATH = os.environ.get("STATE_PATH", "state.json")
 # command listener, no sleep loop). Designed for cron-style hosts like
 # GitHub Actions.
 RUN_ONCE = os.environ.get("RUN_ONCE", "").strip().lower() in ("1", "true", "yes", "on")
+
+SCRAPER_DEBUG = os.environ.get("SCRAPER_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+DEBUG_DIR = os.environ.get("DEBUG_DIR", "debug")
+
+ENABLED_STORES_ENV = os.environ.get("ENABLED_STORES", "").strip()
+
+
+def _enabled_stores() -> list[str]:
+    if not ENABLED_STORES_ENV:
+        return ["blinkit", "zepto", "instamart", "bigbasket"]
+    parts = [p.strip().lower() for p in re.split(r"[,\s]+", ENABLED_STORES_ENV) if p.strip()]
+    aliases = {
+        "swiggy": "instamart",
+        "swiggyinstamart": "instamart",
+        "insta": "instamart",
+        "bb": "bigbasket",
+    }
+    wanted = {aliases.get(p, p) for p in parts}
+    order = ["blinkit", "zepto", "instamart", "bigbasket"]
+    return [s for s in order if s in wanted]
 
 
 # ---------------------------------------------------------------------------
@@ -97,35 +129,66 @@ def save_watchlist(items: list[str]) -> None:
 
 
 def load_state() -> dict:
-    """Load persisted per-keyword state (signatures + checked_at)."""
+    """Load persisted per-keyword-per-store state (signatures + checked_at).
+
+    Backward compatible with the legacy shape:
+      {"keywords": {"lego": {"signature": "...", "checked_at": "..."}}}
+    which is treated as Blinkit-only state.
+    """
     if os.path.exists(STATE_PATH):
         try:
             with open(STATE_PATH, "r") as f:
                 data = json.load(f)
             keywords = data.get("keywords") if isinstance(data, dict) else None
             if isinstance(keywords, dict):
-                return {
-                    k: {
-                        "signature": v.get("signature") or "",
-                        "checked_at": v.get("checked_at") or "",
+                upgraded: dict = {}
+                for kw, v in keywords.items():
+                    if not isinstance(v, dict):
+                        continue
+                    if isinstance(v.get("stores"), dict):
+                        upgraded[kw] = {
+                            "stores": {
+                                store: {
+                                    "signature": (sv or {}).get("signature") or "",
+                                    "checked_at": (sv or {}).get("checked_at") or "",
+                                }
+                                for store, sv in v["stores"].items()
+                                if isinstance(sv, dict)
+                            }
+                        }
+                        continue
+
+                    # Legacy: treat as Blinkit.
+                    upgraded[kw] = {
+                        "stores": {
+                            "blinkit": {
+                                "signature": v.get("signature") or "",
+                                "checked_at": v.get("checked_at") or "",
+                            }
+                        }
                     }
-                    for k, v in keywords.items()
-                    if isinstance(v, dict)
-                }
+                return upgraded
         except Exception as exc:
             logging.warning("Failed to read %s: %s", STATE_PATH, exc)
     return {}
 
 
 def save_state(keywords: dict) -> None:
-    """Persist per-keyword signatures so dedup survives restarts."""
+    """Persist per-keyword-per-store signatures so dedup survives restarts."""
     payload = {
         "keywords": {
             k: {
-                "signature": v.get("signature") or "",
-                "checked_at": v.get("checked_at") or "",
+                "stores": {
+                    store: {
+                        "signature": (sv or {}).get("signature") or "",
+                        "checked_at": (sv or {}).get("checked_at") or "",
+                    }
+                    for store, sv in (v.get("stores") or {}).items()
+                    if isinstance(sv, dict)
+                }
             }
             for k, v in keywords.items()
+            if isinstance(v, dict)
         }
     }
     try:
@@ -139,6 +202,19 @@ def search_url_for(keyword: str) -> str:
     return "https://www.blinkit.com/s/?q=" + urllib.parse.quote(keyword)
 
 
+def _store_search_url(store: str, keyword: str) -> str:
+    store = (store or "").lower()
+    if store == "blinkit":
+        return "https://www.blinkit.com/s/?q=" + urllib.parse.quote(keyword)
+    if store == "zepto":
+        return "https://www.zeptonow.com/search?query=" + urllib.parse.quote(keyword)
+    if store == "instamart":
+        return "https://www.swiggy.com/instamart/search?query=" + urllib.parse.quote(keyword)
+    if store == "bigbasket":
+        return "https://www.bigbasket.com/ps/?q=" + urllib.parse.quote(keyword)
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Browser-side extraction
 # ---------------------------------------------------------------------------
@@ -149,7 +225,7 @@ EXTRACT_PRODUCTS_JS_TEMPLATE = r"""
   const normalize = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const targetNorm = normalize(KEYWORD);
 
-  const titles = document.querySelectorAll('.tw-line-clamp-2');
+  const titles = document.querySelectorAll('.tw-line-clamp-2, [data-testid*=\"product-title\"], [class*=\"line-clamp\"]');
   const items = [];
   const seen = new Set();
   const SKIP_RE = /^(showing\s+results?|search\s+results?|showing\s+related)/i;
@@ -237,7 +313,209 @@ EXTRACT_PRODUCTS_JS_TEMPLATE = r"""
 
 
 def _extraction_js(keyword: str) -> str:
-    return EXTRACT_PRODUCTS_JS_TEMPLATE.replace("__KEYWORD__", json.dumps(keyword))
+    # Keep the original template above for reference; use a more tolerant extractor here.
+    return _blinkit_extraction_js(keyword)
+
+
+BLINKIT_EXTRACT_PRODUCTS_JS_TEMPLATE_V2 = r"""
+(() => {
+  const KEYWORD = __KEYWORD__;
+  const normalize = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const targetNorm = normalize(KEYWORD);
+
+  const RUPEE = '\\u20b9';
+  const LEGACY_RUPEE = '\\u00e2\\u201a\\u00b9'; // "â‚¹" seen in some logs/encodings
+  const PRICE_RE = new RegExp('(?:' + RUPEE + '|' + LEGACY_RUPEE + '|rs\\\\.?)\\\\s*([0-9][0-9,]*)', 'i');
+  const QTY_RE = /\\b(\\d+\\s*(?:pcs|pc|pack|unit|units|g|kg|ml|l))\\b/i;
+  const SKIP_RE = /^(showing\\s+results?|search\\s+results?|showing\\s+related)/i;
+
+  const titles = document.querySelectorAll('.tw-line-clamp-2, [data-testid*=\"product\"], [class*=\"line-clamp\"], a, h3, h2, span, div');
+  const items = [];
+  const seen = new Set();
+
+  const isProductImage = (im) => {
+    const src = im.currentSrc || im.src || im.getAttribute('data-src') || '';
+    if (!src) return false;
+    if (/\\/(eta-icons|icons|badges|store-icons|brand-images?)\\//i.test(src)) return false;
+    if ((im.naturalWidth && im.naturalWidth < 40) || (im.width && im.width < 40)) return false;
+    return true;
+  };
+
+  const bestButtonLabel = (card) => {
+    const btns = card.querySelectorAll('button, [role=\"button\"]');
+    let label = '';
+    for (const b of btns) {
+      const t = ((b.textContent || '').trim()).toUpperCase();
+      if (!t) continue;
+      if (/^(ADD|ADD TO CART|NOTIFY ME|SOLD OUT|OUT OF STOCK)$/.test(t)) return t;
+      if (!label && t.length <= 24) label = t;
+    }
+    return label;
+  };
+
+  const maybeTitle = (el) => {
+    const txt = (el.textContent || '').trim();
+    if (!txt || txt.length < 3) return '';
+    if (SKIP_RE.test(txt)) return '';
+    if (!normalize(txt).includes(targetNorm)) return '';
+    if (txt.length > 180) return txt.slice(0, 180);
+    return txt;
+  };
+
+  for (const t of titles) {
+    const name = maybeTitle(t);
+    if (!name) continue;
+
+    let card = t;
+    let cardEl = null;
+    for (let i = 0; i < 22; i++) {
+      if (!card.parentElement) break;
+      card = card.parentElement;
+      const cardText = (card.textContent || '').replace(/\\s+/g, ' ').trim();
+      if (!PRICE_RE.test(cardText)) continue;
+      const hasBtn = !!card.querySelector('button, [role=\"button\"]');
+      const hasImg = !!Array.from(card.querySelectorAll('img')).find(isProductImage);
+      if (hasBtn || hasImg) { cardEl = card; break; }
+    }
+    if (!cardEl) continue;
+    card = cardEl;
+
+    const cardText = (card.textContent || '').replace(/\\s+/g, ' ').trim();
+    const priceMatch = cardText.match(PRICE_RE);
+    const price = priceMatch ? ('Rs ' + priceMatch[1]) : '';
+    const qtyMatch = cardText.match(QTY_RE);
+    const quantity = qtyMatch ? qtyMatch[1] : '';
+
+    const buttonLabel = bestButtonLabel(card);
+    const lower = cardText.toLowerCase();
+    const outOfStock =
+      /notify me/i.test(buttonLabel) ||
+      /out of stock/.test(lower) ||
+      /sold out/.test(lower);
+    const inStock = !outOfStock && /\\badd\\b/i.test((buttonLabel + ' ' + cardText));
+
+    let image = '';
+    const productImg = Array.from(card.querySelectorAll('img')).find(isProductImage);
+    if (productImg) {
+      image = productImg.currentSrc || productImg.src || productImg.getAttribute('data-src') || '';
+      if (!image && productImg.srcset) image = productImg.srcset.split(',')[0].trim().split(' ')[0];
+    }
+
+    const key = name + '|' + quantity + '|' + price;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push({ store: 'blinkit', name, price, quantity, inStock, outOfStock, buttonLabel, image });
+  }
+  return items;
+})()
+"""
+
+
+def _blinkit_extraction_js(keyword: str) -> str:
+    return BLINKIT_EXTRACT_PRODUCTS_JS_TEMPLATE_V2.replace("__KEYWORD__", json.dumps(keyword))
+
+
+GENERIC_EXTRACT_PRODUCTS_JS_TEMPLATE = r"""
+(() => {
+  const STORE = __STORE__;
+  const KEYWORD = __KEYWORD__;
+  const normalize = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const targetNorm = normalize(KEYWORD);
+
+  const RUPEE = '\\u20b9';
+  const LEGACY_RUPEE = '\\u00e2\\u201a\\u00b9';
+  const PRICE_RE = new RegExp('(?:' + RUPEE + '|' + LEGACY_RUPEE + '|rs\\\\.?)\\\\s*([0-9][0-9,]*)', 'i');
+  const QTY_RE = /\\b(\\d+\\s*(?:pcs|pc|pack|unit|units|g|kg|ml|l))\\b/i;
+  const SKIP_RE = /^(showing\\s+results?|search\\s+results?|showing\\s+related)/i;
+
+  const isProductImage = (im) => {
+    const src = im.currentSrc || im.src || im.getAttribute('data-src') || '';
+    if (!src) return false;
+    if (/\\/(icons?|badges|store-icons|brand-images?)\\//i.test(src)) return false;
+    if ((im.naturalWidth && im.naturalWidth < 40) || (im.width && im.width < 40)) return false;
+    return true;
+  };
+
+  const bestButtonLabel = (card) => {
+    const btns = card.querySelectorAll('button, [role=\"button\"]');
+    let label = '';
+    for (const b of btns) {
+      const t = ((b.textContent || '').trim()).toUpperCase();
+      if (!t) continue;
+      if (/^(ADD|ADD TO CART|NOTIFY ME|SOLD OUT|OUT OF STOCK|ADD\\s*\\+)$/.test(t)) return t;
+      if (!label && t.length <= 24) label = t;
+    }
+    return label;
+  };
+
+  const items = [];
+  const seen = new Set();
+
+  const candidates = [];
+  for (const el of document.querySelectorAll('a, div, span, h1, h2, h3, h4')) {
+    const txt = (el.textContent || '').trim();
+    if (!txt || txt.length < 3) continue;
+    if (SKIP_RE.test(txt)) continue;
+    if (!normalize(txt).includes(targetNorm)) continue;
+    candidates.push(el);
+  }
+
+  for (const t of candidates) {
+    const name = (t.textContent || '').trim().slice(0, 180);
+    if (!name) continue;
+
+    let card = t;
+    let cardEl = null;
+    for (let i = 0; i < 22; i++) {
+      if (!card.parentElement) break;
+      card = card.parentElement;
+      const cardText = (card.textContent || '').replace(/\\s+/g, ' ').trim();
+      if (!PRICE_RE.test(cardText)) continue;
+      const hasBtn = !!card.querySelector('button, [role=\"button\"]');
+      const hasImg = !!Array.from(card.querySelectorAll('img')).find(isProductImage);
+      if (hasBtn || hasImg) { cardEl = card; break; }
+    }
+    if (!cardEl) continue;
+    card = cardEl;
+
+    const cardText = (card.textContent || '').replace(/\\s+/g, ' ').trim();
+    const priceMatch = cardText.match(PRICE_RE);
+    const price = priceMatch ? ('Rs ' + priceMatch[1]) : '';
+    const qtyMatch = cardText.match(QTY_RE);
+    const quantity = qtyMatch ? qtyMatch[1] : '';
+
+    const buttonLabel = bestButtonLabel(card);
+    const lower = cardText.toLowerCase();
+    const outOfStock =
+      /notify me/i.test(buttonLabel) ||
+      /out of stock/.test(lower) ||
+      /sold out/.test(lower);
+    const inStock = !outOfStock && /add/.test((buttonLabel + ' ' + cardText).toLowerCase());
+
+    let image = '';
+    const productImg = Array.from(card.querySelectorAll('img')).find(isProductImage);
+    if (productImg) {
+      image = productImg.currentSrc || productImg.src || productImg.getAttribute('data-src') || '';
+      if (!image && productImg.srcset) image = productImg.srcset.split(',')[0].trim().split(' ')[0];
+    }
+
+    const key = [STORE, name, quantity, price].join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push({ store: STORE, name, price, quantity, inStock, outOfStock, buttonLabel, image });
+  }
+
+  return items;
+})()
+"""
+
+
+def _generic_extraction_js(store: str, keyword: str) -> str:
+    return (
+        GENERIC_EXTRACT_PRODUCTS_JS_TEMPLATE
+        .replace("__STORE__", json.dumps(store))
+        .replace("__KEYWORD__", json.dumps(keyword))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -318,24 +596,41 @@ def _launch_browser(playwright):
     return playwright.chromium.launch(**launch_kwargs)
 
 
-def _new_context(browser):
+def _get_store_location(store: str) -> dict:
+    """Return location dict (lat/lon/locality/landmark/city/state) for a store."""
+    store = (store or "").upper()
+    return {
+        "lat": float(_env(f"{store}_LAT", str(SHARED_LOCATION_LAT))),
+        "lon": float(_env(f"{store}_LON", str(SHARED_LOCATION_LON))),
+        "locality": _env(f"{store}_LOCALITY", SHARED_LOCATION_LOCALITY),
+        "landmark": _env(f"{store}_LANDMARK", SHARED_LOCATION_LANDMARK),
+        "city": _env(f"{store}_CITY", SHARED_LOCATION_CITY),
+        "state": _env(f"{store}_STATE", SHARED_LOCATION_STATE),
+    }
+
+
+def _new_context(browser, store: str):
+    loc = _get_store_location(store)
     context = browser.new_context(
         user_agent=USER_AGENT,
         viewport={"width": 1366, "height": 900},
         locale="en-IN",
         timezone_id="Asia/Kolkata",
-        geolocation={"latitude": LOCATION_LAT, "longitude": LOCATION_LON},
+        geolocation={"latitude": loc["lat"], "longitude": loc["lon"]},
         permissions=["geolocation"],
     )
-    cookie_base = {"domain": ".blinkit.com", "path": "/"}
-    context.add_cookies([
-        {"name": "gr_1_lat", "value": str(LOCATION_LAT), **cookie_base},
-        {"name": "gr_1_lon", "value": str(LOCATION_LON), **cookie_base},
-        {"name": "gr_1_locality", "value": LOCATION_LOCALITY, **cookie_base},
-        {"name": "gr_1_landmark", "value": LOCATION_LANDMARK, **cookie_base},
-        {"name": "gr_1_city", "value": LOCATION_CITY, **cookie_base},
-        {"name": "gr_1_state", "value": LOCATION_STATE, **cookie_base},
-    ])
+
+    # Store-specific cookie injection (best-effort; some stores require UI flows).
+    if store == "blinkit":
+        cookie_base = {"domain": ".blinkit.com", "path": "/"}
+        context.add_cookies([
+            {"name": "gr_1_lat", "value": str(loc["lat"]), **cookie_base},
+            {"name": "gr_1_lon", "value": str(loc["lon"]), **cookie_base},
+            {"name": "gr_1_locality", "value": loc["locality"], **cookie_base},
+            {"name": "gr_1_landmark", "value": loc["landmark"], **cookie_base},
+            {"name": "gr_1_city", "value": loc["city"], **cookie_base},
+            {"name": "gr_1_state", "value": loc["state"], **cookie_base},
+        ])
     return context
 
 
@@ -345,38 +640,138 @@ def _autoscroll(page, steps: int = 10, delay_ms: int = 600) -> None:
         page.wait_for_timeout(delay_ms)
 
 
-def get_products(page, keyword: str) -> list[dict]:
-    url = search_url_for(keyword)
+def _safe_filename(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9._-]+", "_", s)
+    return (s.strip("_")[:80]) or "item"
+
+
+def _classify_page(text: str) -> str:
+    t = (text or "").lower()
+    if any(x in t for x in ["select your location", "detect my location", "choose delivery", "set your location"]):
+        return "location-gated"
+    if any(x in t for x in ["captcha", "unusual traffic", "verify you are", "access denied", "blocked", "robot check"]):
+        return "blocked"
+    return "render-or-extraction-miss"
+
+
+def _maybe_write_debug(page, store: str, keyword: str, classification: str, url: str, force: bool) -> None:
+    debug = SCRAPER_DEBUG or force
+    if not debug:
+        return
+
+    root = Path(DEBUG_DIR)
+    root.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    folder = root / f"{ts}_{_safe_filename(store)}_{_safe_filename(keyword)}"
+    folder.mkdir(parents=True, exist_ok=True)
+
+    try:
+        page.screenshot(path=str(folder / "page.png"), full_page=True)
+    except Exception as exc:
+        logging.warning("[%s/%s] screenshot failed: %s", store, keyword, exc)
+    try:
+        (folder / "page.html").write_text(page.content(), encoding="utf-8", errors="replace")
+    except Exception as exc:
+        logging.warning("[%s/%s] html capture failed: %s", store, keyword, exc)
+
+    try:
+        body = page.inner_text("body")
+    except Exception:
+        body = ""
+
+    meta = {
+        "store": store,
+        "keyword": keyword,
+        "url": url,
+        "classification": classification,
+        "captured_at": datetime.now().isoformat(timespec="seconds"),
+        "body_snippet": (body or "")[:2000],
+    }
+    try:
+        (folder / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logging.warning("[%s/%s] meta write failed: %s", store, keyword, exc)
+
+
+def _wait_for_any(page, js_predicates: list[str], timeout_ms: int) -> None:
+    deadline = time.time() + (timeout_ms / 1000.0)
+    last_err = None
+    while time.time() < deadline:
+        for js in js_predicates:
+            try:
+                ok = page.evaluate(js)
+                if ok:
+                    return
+            except Exception as exc:
+                last_err = exc
+        page.wait_for_timeout(500)
+    if last_err is not None:
+        raise PWTimeout(str(last_err))
+    raise PWTimeout("timeout")
+
+
+def _scrape_store_products(page, store: str, keyword: str) -> tuple[list[dict], str]:
+    """Return (products, classification)."""
+    url = _store_search_url(store, keyword)
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
     except PWTimeout:
-        logging.warning("[%s] search page timed out on initial load; continuing.", keyword)
-    page.wait_for_timeout(4000)
+        logging.warning("[%s/%s] page timed out on initial load; continuing.", store, keyword)
+
+    page.wait_for_timeout(2000)
+
+    preds = [
+        "document.body && document.body.innerText && (/\\badd\\b/i.test(document.body.innerText) || document.body.innerText.includes('ADD'))",
+        "document.querySelectorAll('img').length > 10",
+        "document.body && document.body.innerText && (document.body.innerText.includes('\\u20b9') || /rs\\.?\\s*\\d/i.test(document.body.innerText))",
+        "document.body && document.body.innerText && (document.body.innerText.toLowerCase().includes('select your location') || document.body.innerText.toLowerCase().includes('detect my location'))",
+    ]
     try:
-        page.wait_for_function(
-            "document.body && document.body.innerText.includes('ADD')",
-            timeout=15000,
-        )
+        _wait_for_any(page, preds, timeout_ms=15000)
     except PWTimeout:
-        logging.warning("[%s] no ADD buttons appeared within 15s; continuing.", keyword)
+        logging.warning("[%s/%s] no obvious results signal within 15s; continuing.", store, keyword)
 
-    _autoscroll(page)
-    page.evaluate("window.scrollTo(0, 0)")
-    page.wait_for_timeout(1500)
+    products: list[dict] = []
+    deadline = time.time() + 20.0
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            if store == "blinkit":
+                products = page.evaluate(_extraction_js(keyword))
+            else:
+                products = page.evaluate(_generic_extraction_js(store, keyword))
+        except Exception as exc:
+            logging.warning("[%s/%s] extraction attempt %d failed: %s", store, keyword, attempt, exc)
+            products = []
+
+        if products:
+            break
+
+        _autoscroll(page, steps=3, delay_ms=400)
+        page.wait_for_timeout(800)
 
     try:
-        products = page.evaluate(_extraction_js(keyword))
-    except Exception as exc:
-        logging.error("[%s] failed to extract products: %s", keyword, exc)
-        return []
+        body_text = page.inner_text("body")
+    except Exception:
+        body_text = ""
+    classification = _classify_page(body_text)
 
+    force_debug = RUN_ONCE and not products
     if not products:
-        body_text = page.inner_text("body").lower()
-        if "select your location" in body_text or "detect my location" in body_text:
-            logging.warning(
-                "[%s] Blinkit is asking for a delivery location. Location "
-                "cookies may not have taken effect.", keyword,
-            )
+        _maybe_write_debug(page, store, keyword, classification, url=url, force=force_debug)
+
+    # Ensure a store field is present for downstream formatting.
+    for p in products:
+        p.setdefault("store", store)
+
+    return products, classification
+
+
+def get_products(page, keyword: str) -> list[dict]:
+    # Backward compatible API: Blinkit-only scrape.
+    products, _ = _scrape_store_products(page, "blinkit", keyword)
     return products
 
 
@@ -464,18 +859,85 @@ def _send_full_report(
         send_telegram_media_group(media, chat_id=chat_id)
 
 
+def _format_product_line_with_store(product: dict) -> str:
+    store = (product.get("store") or "").strip().upper()
+    base = _format_product_line(product)
+    if store:
+        return f"({store}) {base}"
+    return base
+
+
+def _build_summary_multi(
+    keyword: str,
+    store_to_products: dict[str, list[dict]],
+    checked_at: str | None = None,
+) -> str:
+    location = (
+        f"{SHARED_LOCATION_LANDMARK}, {SHARED_LOCATION_CITY} "
+        f"({SHARED_LOCATION_LAT:.4f}, {SHARED_LOCATION_LON:.4f})"
+    )
+    header = f"\"{keyword}\" stock @ {location}"
+    if checked_at:
+        header += f"\nChecked: {checked_at}"
+
+    stores = [s for s in _enabled_stores() if s in (store_to_products or {})]
+    if not stores:
+        return header + "\n(no stores enabled)"
+
+    blocks: list[str] = []
+    for store in stores:
+        products = store_to_products.get(store) or []
+        url = _store_search_url(store, keyword)
+        if not products:
+            blocks.append(f"{store.upper()}:\n  (no matching products)\n  {url}")
+            continue
+        lines = ["  " + _format_product_line(p) for p in _ordered_products(products)]
+        blocks.append(f"{store.upper()}:\n" + "\n".join(lines) + f"\n  {url}")
+
+    return header + "\n\n" + "\n\n".join(blocks)
+
+
+def _build_media_items_multi(store_to_products: dict[str, list[dict]]) -> list[dict]:
+    all_products: list[dict] = []
+    for store, products in (store_to_products or {}).items():
+        for p in (products or []):
+            p.setdefault("store", store)
+        all_products.extend(products or [])
+
+    items = []
+    for p in _ordered_products(all_products):
+        image = (p.get("image") or "").strip()
+        if not image or not image.startswith("http"):
+            continue
+        items.append({"image": image, "caption": _format_product_line_with_store(p)})
+    return items
+
+
+def _send_full_report_multi(
+    keyword: str,
+    store_to_products: dict[str, list[dict]],
+    checked_at: str,
+    chat_id: str | None = None,
+) -> None:
+    summary = _build_summary_multi(keyword, store_to_products, checked_at=checked_at)
+    send_telegram_message(summary, chat_id=chat_id)
+    media = _build_media_items_multi(store_to_products)
+    if media:
+        send_telegram_media_group(media, chat_id=chat_id)
+
+
 # ---------------------------------------------------------------------------
 # Scrape loop
 # ---------------------------------------------------------------------------
 
-def run_once(browser, state: dict) -> None:
+def _run_once_legacy(browser, state: dict) -> None:
     with state["lock"]:
         keywords = list(state["watchlist"])
     if not keywords:
         logging.info("Watchlist is empty; nothing to scrape.")
         return
 
-    context = _new_context(browser)
+    context = _new_context(browser, "blinkit")
     page = context.new_page()
     try:
         for keyword in keywords:
@@ -514,12 +976,76 @@ def run_once(browser, state: dict) -> None:
         save_state(state["keywords"])
 
 
+def run_once(browser, state: dict) -> None:
+    with state["lock"]:
+        keywords = list(state["watchlist"])
+    if not keywords:
+        logging.info("Watchlist is empty; nothing to scrape.")
+        return
+
+    stores = _enabled_stores()
+    if not stores:
+        logging.warning("No stores enabled.")
+        return
+
+    changed_keywords: set[str] = set()
+
+    for store in stores:
+        context = _new_context(browser, store)
+        page = context.new_page()
+        try:
+            for keyword in keywords:
+                try:
+                    products, classification = _scrape_store_products(page, store, keyword)
+                except Exception as exc:
+                    logging.error("[%s/%s] scrape failed: %s", store, keyword, exc)
+                    continue
+
+                logging.info("[%s/%s] found %d product(s) (%s).", store, keyword, len(products), classification)
+                for product in products:
+                    logging.info("  %s", _format_product_line_with_store(product))
+
+                checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                signature = _summary_signature(products)
+
+                with state["lock"]:
+                    kw_entry = state["keywords"].setdefault(keyword, {"stores": {}})
+                    stores_state = kw_entry.setdefault("stores", {})
+                    prev = stores_state.get(store, {})
+                    stores_state[store] = {
+                        "products": products,
+                        "checked_at": checked_at,
+                        "signature": signature,
+                    }
+                    changed = signature != (prev.get("signature") or "")
+
+                if changed:
+                    changed_keywords.add(keyword)
+        finally:
+            context.close()
+
+    for keyword in sorted(changed_keywords):
+        with state["lock"]:
+            kw_entry = state["keywords"].get(keyword) or {}
+            store_state = (kw_entry.get("stores") or {})
+            store_to_products = {
+                store: (store_state.get(store) or {}).get("products") or []
+                for store in stores
+            }
+        checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _send_full_report_multi(keyword, store_to_products, checked_at)
+        logging.info("[%s] changes detected in at least one store; Telegram report sent.", keyword)
+
+    with state["lock"]:
+        save_state(state["keywords"])
+
+
 # ---------------------------------------------------------------------------
 # Telegram command handling
 # ---------------------------------------------------------------------------
 
 HELP_TEXT = (
-    "Blinkit Stock Notifier\n"
+    "Multi-store Stock Notifier\n"
     "Commands:\n"
     "  /status            — show the latest report for every keyword\n"
     "  /status <keyword>  — show the latest report for one keyword\n"
@@ -573,11 +1099,28 @@ def handle_status_command(state: dict, chat_id: str, arg: str = "") -> None:
             pending.append(kw)
             continue
         logging.info("/status requested for %r — sending cached report.", kw)
-        _send_full_report(
-            kw, data.get("products") or [],
-            checked_at=data.get("checked_at") or "unknown",
-            chat_id=chat_id,
-        )
+        stores_state = data.get("stores") if isinstance(data, dict) else None
+        if isinstance(stores_state, dict):
+            store_to_products = {
+                store: (sv.get("products") or [])
+                for store, sv in stores_state.items()
+                if isinstance(sv, dict)
+            }
+            checked_at = max(
+                [(sv.get("checked_at") or "") for sv in stores_state.values() if isinstance(sv, dict)],
+                default="",
+            ) or "unknown"
+            _send_full_report_multi(
+                kw, store_to_products,
+                checked_at=checked_at,
+                chat_id=chat_id,
+            )
+        else:
+            _send_full_report(
+                kw, data.get("products") or [],
+                checked_at=data.get("checked_at") or "unknown",
+                chat_id=chat_id,
+            )
 
     if pending:
         send_telegram_message(
@@ -732,11 +1275,12 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    logging.info("Blinkit Stock Notifier (Playwright) started.")
+    logging.info("Multi-store Stock Notifier (Playwright) started.")
+    logging.info("Enabled stores: %s", ", ".join(_enabled_stores()) or "(none)")
     logging.info(
         "Location: %s, %s, %s (%.4f, %.4f)",
-        LOCATION_LANDMARK, LOCATION_LOCALITY, LOCATION_CITY,
-        LOCATION_LAT, LOCATION_LON,
+        SHARED_LOCATION_LANDMARK, SHARED_LOCATION_LOCALITY, SHARED_LOCATION_CITY,
+        SHARED_LOCATION_LAT, SHARED_LOCATION_LON,
     )
     logging.info("Check interval: %d seconds", CHECK_INTERVAL)
 
@@ -750,7 +1294,7 @@ def main() -> None:
     state: dict = {
         "lock": threading.Lock(),
         "watchlist": watchlist,
-        # keyword -> {signature, checked_at, products?}
+        # keyword -> {"stores": {store -> {signature, checked_at, products?}}}
         "keywords": {k: dict(v) for k, v in persisted.items()},
     }
 

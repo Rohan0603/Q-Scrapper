@@ -1,4 +1,4 @@
-name: Blinkit stock check
+name: Multi-store stock check
 
 # Runs the stock notifier on a schedule. Sends Telegram alerts only when
 # something has changed since the previous run (dedup state is cached
@@ -61,6 +61,15 @@ jobs:
           RUN_ONCE: "1"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SCRAPER_DEBUG: "1"
+          DEBUG_DIR: "debug"
+          ENABLED_STORES: ${{ vars.ENABLED_STORES }}
+          LAT: ${{ vars.LAT }}
+          LON: ${{ vars.LON }}
+          LOCALITY: ${{ vars.LOCALITY }}
+          LANDMARK: ${{ vars.LANDMARK }}
+          CITY: ${{ vars.CITY }}
+          STATE: ${{ vars.STATE }}
           # Optional location overrides — defaults are Whitefield, Bengaluru.
           BLINKIT_LAT: ${{ vars.BLINKIT_LAT }}
           BLINKIT_LON: ${{ vars.BLINKIT_LON }}
@@ -69,6 +78,14 @@ jobs:
           BLINKIT_CITY: ${{ vars.BLINKIT_CITY }}
           BLINKIT_STATE: ${{ vars.BLINKIT_STATE }}
         run: python -u main.py
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-debug-${{ github.run_id }}
+          path: debug
+          if-no-files-found: ignore
 
       - name: Save notifier state cache
         if: always()
