@@ -649,7 +649,15 @@ def _classify_page(text: str) -> str:
     t = (text or "").lower()
     if any(x in t for x in ["select your location", "detect my location", "choose delivery", "set your location"]):
         return "location-gated"
+    if any(x in t for x in ["select location", "login/ sign up", "login / sign up"]):
+        # Many sites show search results only after a delivery location is set.
+        return "location-gated"
     if any(x in t for x in ["captcha", "unusual traffic", "verify you are", "access denied", "blocked", "robot check"]):
+        return "blocked"
+    if any(x in t for x in ["cloudflare", "cloudfront", "request blocked", "403 error", "ray id"]):
+        return "blocked"
+    if any(x in t for x in ["something went wrong", "try again later", "our best minds are on this"]):
+        # Often a soft block / WAF / generic error page on headless infra.
         return "blocked"
     return "render-or-extraction-miss"
 
@@ -1005,18 +1013,30 @@ def run_once(browser, state: dict) -> None:
                     logging.info("  %s", _format_product_line_with_store(product))
 
                 checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                signature = _summary_signature(products)
 
                 with state["lock"]:
                     kw_entry = state["keywords"].setdefault(keyword, {"stores": {}})
                     stores_state = kw_entry.setdefault("stores", {})
                     prev = stores_state.get(store, {})
-                    stores_state[store] = {
-                        "products": products,
-                        "checked_at": checked_at,
-                        "signature": signature,
-                    }
-                    changed = signature != (prev.get("signature") or "")
+
+                    # If the page looks blocked or location-gated, do not overwrite
+                    # the last known good state and do not trigger alerts.
+                    if classification in ("blocked", "location-gated"):
+                        stores_state[store] = {
+                            "products": prev.get("products") or [],
+                            "checked_at": checked_at,
+                            "signature": prev.get("signature") or "",
+                            "last_error": classification,
+                        }
+                        changed = False
+                    else:
+                        signature = _summary_signature(products)
+                        stores_state[store] = {
+                            "products": products,
+                            "checked_at": checked_at,
+                            "signature": signature,
+                        }
+                        changed = signature != (prev.get("signature") or "")
 
                 if changed:
                     changed_keywords.add(keyword)
