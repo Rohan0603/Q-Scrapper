@@ -1,94 +1,180 @@
-# Blinkit Hotwheels Stock Notifier
-# Main script for Replit deployment
+"""Blinkit Hotwheels Stock Notifier (Playwright edition).
 
-import time
+Polls a Blinkit Hotwheels category page using a headless Chromium browser,
+finds product links, checks each product page for stock availability, and
+sends a Telegram message the first time a product is detected in stock.
+"""
+
 import logging
-
+import os
+import shutil
+import time
 
 import requests
-import os
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# --- Telegram Bot Config ---
-# For local testing, you can set these directly. For Replit, use secrets.
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8728684147:AAEv5DiF9ZdbPu4wuE08gQVPffaQfoKzCEM")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7301099717")  # User's chat id
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# --- Telegram Notification Function ---
-def send_telegram_message(message: str):
+HOTWHEELS_CATEGORY_URL = os.environ.get(
+    "HOTWHEELS_CATEGORY_URL", "https://www.blinkit.com/cn/hotwheels"
+)
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "600"))
+
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+)
+
+OUT_OF_STOCK_PHRASES = (
+    "out of stock",
+    "currently unavailable",
+    "notify me when available",
+    "sold out",
+)
+IN_STOCK_PHRASES = ("add to cart", "add to bag")
+
+
+def send_telegram_message(message: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.error("Telegram credentials missing; cannot send message.")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
         response = requests.post(url, data=payload, timeout=10)
         response.raise_for_status()
-        logging.info(f"Sent Telegram message: {message}")
-    except Exception as e:
-        logging.error(f"Failed to send Telegram message: {e}")
+        logging.info("Sent Telegram message: %s", message)
+    except Exception as exc:
+        logging.error("Failed to send Telegram message: %s", exc)
 
-# --- Blinkit Hotwheels Scraper ---
-from bs4 import BeautifulSoup
 
-# Replace with the actual Blinkit Hotwheels category URL
-HOTWHEELS_CATEGORY_URL = "https://www.blinkit.com/cn/hotwheels"
+def _launch_browser(playwright):
+    chromium_path = shutil.which("chromium") or shutil.which("chromium-browser")
+    launch_kwargs = {
+        "headless": True,
+        "args": [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ],
+    }
+    if chromium_path:
+        launch_kwargs["executable_path"] = chromium_path
+    return playwright.chromium.launch(**launch_kwargs)
 
-def get_hotwheels_product_urls():
-    """
-    Scrape all Hotwheels product URLs from the Blinkit category page.
-    Returns a list of product URLs.
-    """
+
+def _new_context(browser):
+    return browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={"width": 1366, "height": 900},
+        locale="en-IN",
+        timezone_id="Asia/Kolkata",
+    )
+
+
+def _autoscroll(page, steps: int = 8, delay_ms: int = 700) -> None:
+    for _ in range(steps):
+        page.mouse.wheel(0, 4000)
+        page.wait_for_timeout(delay_ms)
+
+
+def get_hotwheels_product_urls(page) -> list[str]:
     try:
-        resp = requests.get(HOTWHEELS_CATEGORY_URL, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        product_links = []
-        # This selector may need adjustment based on actual Blinkit HTML structure
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "/p/" in href and "hotwheels" in href:
-                # Ensure full URL
-                if href.startswith("http"):
-                    product_links.append(href)
-                else:
-                    product_links.append("https://www.blinkit.com" + href)
-        logging.info(f"Found {len(product_links)} Hotwheels product URLs.")
-        return list(set(product_links))
-    except Exception as e:
-        logging.error(f"Error scraping Hotwheels URLs: {e}")
-        return []
+        page.goto(HOTWHEELS_CATEGORY_URL, wait_until="domcontentloaded", timeout=30000)
+    except PWTimeout:
+        logging.warning("Category page timed out on initial load; continuing.")
+    page.wait_for_timeout(2500)
+    _autoscroll(page)
 
-def check_stock_and_notify(product_urls, check_interval=600):
-    """
-    For each product URL, check if it's in stock. If so, send a Telegram notification.
-    Runs in a loop with the specified interval (default: 600s = 10min).
-    """
-    notified = set()
-    while True:
-        for url in product_urls:
+    hrefs = page.eval_on_selector_all(
+        "a[href]", "els => els.map(e => e.href).filter(Boolean)"
+    )
+    product_urls = set()
+    for href in hrefs:
+        lowered = href.lower()
+        if "blinkit.com" not in lowered:
+            continue
+        if "/prn/" in lowered or "/p/" in lowered:
+            if "hotwheels" in lowered or "hot-wheels" in lowered or "/prn/" in lowered:
+                product_urls.add(href.split("#")[0])
+    logging.info("Found %d candidate product URLs.", len(product_urls))
+
+    if not product_urls:
+        body_text = page.inner_text("body").lower()
+        if "select your location" in body_text or "detect my location" in body_text:
+            logging.warning(
+                "Blinkit is asking for a delivery location. The category page "
+                "won't show products until a pincode/location is set."
+            )
+    return sorted(product_urls)
+
+
+def is_in_stock(page, url: str) -> bool | None:
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    except PWTimeout:
+        logging.warning("Product page timed out: %s", url)
+        return None
+    page.wait_for_timeout(2000)
+    _autoscroll(page, steps=2, delay_ms=400)
+
+    try:
+        text = page.inner_text("body").lower()
+    except Exception as exc:
+        logging.error("Failed to read product page %s: %s", url, exc)
+        return None
+
+    if any(phrase in text for phrase in OUT_OF_STOCK_PHRASES):
+        return False
+    if any(phrase in text for phrase in IN_STOCK_PHRASES):
+        return True
+    return None
+
+
+def run_once(browser, notified: set[str]) -> None:
+    context = _new_context(browser)
+    page = context.new_page()
+    try:
+        urls = get_hotwheels_product_urls(page)
+        for url in urls:
             try:
-                resp = requests.get(url, timeout=15)
-                resp.raise_for_status()
-                soup = BeautifulSoup(resp.text, "html.parser")
-                # Adjust selector as needed for Blinkit
-                out_of_stock = False
-                if soup.find(string=lambda t: t and "out of stock" in t.lower()):
-                    out_of_stock = True
-                if not out_of_stock and url not in notified:
-                    msg = f"Hotwheels in stock! {url}"
-                    send_telegram_message(msg)
+                stock = is_in_stock(page, url)
+                if stock is True and url not in notified:
+                    send_telegram_message(f"Hotwheels in stock! {url}")
                     notified.add(url)
-                    logging.info(f"In stock: {url}")
-                elif out_of_stock:
-                    logging.info(f"Out of stock: {url}")
-            except Exception as e:
-                logging.error(f"Error checking stock for {url}: {e}")
-        logging.info(f"Sleeping for {check_interval} seconds before next check...")
-        time.sleep(check_interval)
+                    logging.info("In stock: %s", url)
+                elif stock is False:
+                    logging.info("Out of stock: %s", url)
+                else:
+                    logging.info("Stock status unknown: %s", url)
+            except Exception as exc:
+                logging.error("Error checking %s: %s", url, exc)
+    finally:
+        context.close()
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    logging.info("Blinkit Hotwheels Stock Notifier (Playwright) started.")
+
+    notified: set[str] = set()
+    with sync_playwright() as playwright:
+        browser = _launch_browser(playwright)
+        try:
+            while True:
+                try:
+                    run_once(browser, notified)
+                except Exception as exc:
+                    logging.error("Run failed: %s", exc)
+                logging.info("Sleeping %d seconds before next check...", CHECK_INTERVAL)
+                time.sleep(CHECK_INTERVAL)
+        finally:
+            browser.close()
+
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    logging.info("Blinkit Hotwheels Stock Notifier started.")
-    # Scrape Hotwheels URLs
-    urls = get_hotwheels_product_urls()
-    if urls:
-        check_stock_and_notify(urls, check_interval=600)  # 10 minutes
-    else:
-        logging.error("No Hotwheels URLs found. Exiting.")
+    main()
