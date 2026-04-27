@@ -26,6 +26,19 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+
+def _load_json_file(path: str):
+    data = Path(path).read_bytes()
+    if not data or not data.strip():
+        raise ValueError("empty file")
+    # Handle common encodings (Windows editors often write UTF-16, and some tools write UTF-8 BOM).
+    if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+        text = data.decode("utf-16")
+    else:
+        text = data.decode("utf-8-sig")
+    return json.loads(text)
+
+
 def _env(name: str, default: str) -> str:
     """Like os.environ.get, but treats empty/whitespace as unset.
 
@@ -104,8 +117,7 @@ def _normalize_keyword(kw: str) -> str:
 def load_watchlist() -> list[str]:
     if os.path.exists(WATCHLIST_PATH):
         try:
-            with open(WATCHLIST_PATH, "r") as f:
-                data = json.load(f)
+            data = _load_json_file(WATCHLIST_PATH)
             if isinstance(data, list):
                 cleaned = []
                 seen = set()
@@ -122,7 +134,7 @@ def load_watchlist() -> list[str]:
 
 def save_watchlist(items: list[str]) -> None:
     try:
-        with open(WATCHLIST_PATH, "w") as f:
+        with open(WATCHLIST_PATH, "w", encoding="utf-8") as f:
             json.dump(items, f, indent=2)
     except Exception as exc:
         logging.error("Failed to save watchlist: %s", exc)
@@ -137,8 +149,7 @@ def load_state() -> dict:
     """
     if os.path.exists(STATE_PATH):
         try:
-            with open(STATE_PATH, "r") as f:
-                data = json.load(f)
+            data = _load_json_file(STATE_PATH)
             keywords = data.get("keywords") if isinstance(data, dict) else None
             if isinstance(keywords, dict):
                 upgraded: dict = {}
@@ -192,7 +203,7 @@ def save_state(keywords: dict) -> None:
         }
     }
     try:
-        with open(STATE_PATH, "w") as f:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
     except Exception as exc:
         logging.error("Failed to save state: %s", exc)
