@@ -756,15 +756,23 @@ def _scrape_store_products(page, store: str, keyword: str) -> tuple[list[dict], 
     while time.time() < deadline:
         attempt += 1
         try:
+            result = None
             if store == "blinkit":
                 result = page.evaluate(_extraction_js(keyword))
-                if (result and getattr(result, '__debug__', False)):
-                    debug_nodes = result['nodes']
-                    products = []
-                else:
-                    products = result
             else:
-                products = page.evaluate(_generic_extraction_js(store, keyword))
+                result = page.evaluate(_generic_extraction_js(store, keyword))
+
+            # If result is a dict with __debug__, handle as debug_nodes
+            if isinstance(result, dict) and result.get("__debug__"):
+                debug_nodes = result.get('nodes')
+                products = []
+            # If result is a list, assign to products
+            elif isinstance(result, list):
+                products = result
+            else:
+                # Unexpected type, log and treat as no products
+                logging.error("[%s/%s] Extraction returned unexpected type: %r", store, keyword, type(result))
+                products = []
         except Exception as exc:
             logging.warning("[%s/%s] extraction attempt %d failed: %s", store, keyword, attempt, exc)
             products = []
