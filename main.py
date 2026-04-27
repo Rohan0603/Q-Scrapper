@@ -147,13 +147,14 @@ def load_state() -> dict:
       {"keywords": {"lego": {"signature": "...", "checked_at": "..."}}}
     which is treated as Blinkit-only state.
     """
+    keywords = {}
     if os.path.exists(STATE_PATH):
         try:
             data = _load_json_file(STATE_PATH)
-            keywords = data.get("keywords") if isinstance(data, dict) else None
-            if isinstance(keywords, dict):
+            raw_keywords = data.get("keywords") if isinstance(data, dict) else None
+            if isinstance(raw_keywords, dict):
                 upgraded: dict = {}
-                for kw, v in keywords.items():
+                for kw, v in raw_keywords.items():
                     if not isinstance(v, dict):
                         continue
                     if isinstance(v.get("stores"), dict):
@@ -178,10 +179,17 @@ def load_state() -> dict:
                             }
                         }
                     }
-                return upgraded
+                keywords = upgraded
         except Exception as exc:
             logging.warning("Failed to read %s: %s", STATE_PATH, exc)
-    return {}
+    return keywords
+
+# At runtime, construct the state object as:
+# state = {
+#     "keywords": load_state(),
+#     "lock": threading.Lock(),
+#     "watchlist": load_watchlist(),
+# }
 
 
 def save_state(keywords: dict) -> None:
@@ -1327,15 +1335,15 @@ def main() -> None:
     watchlist = load_watchlist()
     logging.info("Watchlist (%d): %s", len(watchlist), ", ".join(watchlist))
 
-    persisted = load_state()
-    if persisted:
-        logging.info("Loaded persisted state for %d keyword(s).", len(persisted))
+    keywords = load_state()
+    if keywords:
+        logging.info("Loaded persisted state for %d keyword(s).", len(keywords))
 
     state: dict = {
         "lock": threading.Lock(),
         "watchlist": watchlist,
         # keyword -> {"stores": {store -> {signature, checked_at, products?}}}
-        "keywords": {k: dict(v) for k, v in persisted.items()},
+        "keywords": keywords,
     }
 
     if RUN_ONCE:
