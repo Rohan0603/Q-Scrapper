@@ -330,93 +330,78 @@ def _extraction_js(keyword: str) -> str:
 
 BLINKIT_EXTRACT_PRODUCTS_JS_TEMPLATE_V2 = r"""
 (() => {
-  const KEYWORD = __KEYWORD__;
-  const normalize = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const targetNorm = normalize(KEYWORD);
-
-  const PRICE_RE = /(?:₹|rs\.?)\s*([0-9][0-9,]*)/i;
-  const LEGACY_RUPEE = '\\u00e2\\u201a\\u00b9'; // "â‚¹" seen in some logs/encodings
-  const QTY_RE = /\\b(\\d+\\s*(?:pcs|pc|pack|unit|units|g|kg|ml|l))\\b/i;
-  const SKIP_RE = /^(showing\\s+results?|search\\s+results?|showing\\s+related)/i;
-
-  const titles = document.querySelectorAll('.tw-line-clamp-2, [data-testid*=\"product\"], [class*=\"line-clamp\"], a, h3, h2, span, div');
-  const items = [];
-  const seen = new Set();
-
-  const isProductImage = (im) => {
-    const src = im.currentSrc || im.src || im.getAttribute('data-src') || '';
-    if (!src) return false;
-    if (/\/(eta-icons|icons|badges|store-icons|brand-images?)\//i.test(src)) return false;
-    if ((im.naturalWidth && im.naturalWidth < 40) || (im.width && im.width < 40)) return false;
-    return true;
-  };
-
-  const bestButtonLabel = (card) => {
-    const btns = card.querySelectorAll('button, [role=\"button\"]');
-    let label = '';
-    for (const b of btns) {
-      const t = ((b.textContent || '').trim()).toUpperCase();
-      if (!t) continue;
-      if (/^(ADD|ADD TO CART|NOTIFY ME|SOLD OUT|OUT OF STOCK)$/.test(t)) return t;
-      if (!label && t.length <= 24) label = t;
+    const KEYWORD = __KEYWORD__;
+    const normalize = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const targetNorm = normalize(KEYWORD);
+    const PRICE_RE = /(?:₹|rs\.?|inr)\s*([0-9][0-9,]*)/i;
+    const QTY_RE = /\b(\d+\s*(?:pcs|pc|pack|unit|units|g|kg|ml|l))\b/i;
+    const SKIP_RE = /^(showing\s+results?|search\s+results?|showing\s+related)/i;
+    const items = [];
+    const seen = new Set();
+    // More robust: look for all product cards with price and add button or image
+    const candidates = Array.from(document.querySelectorAll('div, section, li, article'));
+    for (const card of candidates) {
+        const cardText = (card.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!cardText || cardText.length < 10) continue;
+        if (!PRICE_RE.test(cardText)) continue;
+        // Try to find a title
+        let name = '';
+        let titleEl = card.querySelector('.tw-line-clamp-2, [data-testid*="product-title"], [class*="line-clamp"], h3, h2, span, a, div');
+        if (titleEl) {
+            name = (titleEl.textContent || '').trim();
+        } else {
+            // fallback: first 40 chars of cardText
+            name = cardText.slice(0, 40);
+        }
+        if (!name || name.length < 3) continue;
+        if (SKIP_RE.test(name)) continue;
+        if (!normalize(name).includes(targetNorm)) continue;
+        const priceMatch = cardText.match(PRICE_RE);
+        const price = priceMatch ? ('Rs ' + priceMatch[1]) : '';
+        const qtyMatch = cardText.match(QTY_RE);
+        const quantity = qtyMatch ? qtyMatch[1] : '';
+        // Button detection
+        let buttonLabel = '';
+        const btns = card.querySelectorAll('button, [role="button"]');
+        for (const b of btns) {
+            const t = ((b.textContent || '').trim()).toUpperCase();
+            if (!t) continue;
+            if (/^(ADD|ADD TO CART|NOTIFY ME|SOLD OUT|OUT OF STOCK)$/.test(t)) { buttonLabel = t; break; }
+            if (!buttonLabel && t.length <= 24) buttonLabel = t;
+        }
+        const lower = cardText.toLowerCase();
+        const outOfStock =
+            /notify me/i.test(buttonLabel) ||
+            /out of stock/.test(lower) ||
+            /sold out/.test(lower);
+        const inStock = !outOfStock && /add/.test((buttonLabel + ' ' + cardText).toLowerCase());
+        // Image detection
+        let image = '';
+        const imgs = Array.from(card.querySelectorAll('img'));
+        for (const im of imgs) {
+            const src = im.currentSrc || im.src || im.getAttribute('data-src') || '';
+            if (!src) continue;
+            if (/\/(eta-icons|icons|badges|store-icons|brand-images?)\//i.test(src)) continue;
+            if ((im.naturalWidth && im.naturalWidth < 40) || (im.width && im.width < 40)) continue;
+            image = src; break;
+        }
+        const key = name + '|' + quantity + '|' + price;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push({ store: 'blinkit', name, price, quantity, inStock, outOfStock, buttonLabel, image });
     }
-    return label;
-  };
-
-  const maybeTitle = (el) => {
-    const txt = (el.textContent || '').trim();
-    if (!txt || txt.length < 3) return '';
-    if (SKIP_RE.test(txt)) return '';
-    if (!normalize(txt).includes(targetNorm)) return '';
-    if (txt.length > 180) return txt.slice(0, 180);
-    return txt;
-  };
-
-  for (const t of titles) {
-    const name = maybeTitle(t);
-    if (!name) continue;
-
-    let card = t;
-    let cardEl = null;
-    for (let i = 0; i < 22; i++) {
-      if (!card.parentElement) break;
-      card = card.parentElement;
-      const cardText = (card.textContent || '').replace(/\\s+/g, ' ').trim();
-      if (!PRICE_RE.test(cardText)) continue;
-      const hasBtn = !!card.querySelector('button, [role=\"button\"]');
-      const hasImg = !!Array.from(card.querySelectorAll('img')).find(isProductImage);
-      if (hasBtn || hasImg) { cardEl = card; break; }
+    // For debugging: if no items, dump all product-like nodes
+    if (items.length === 0) {
+        const debugNodes = [];
+        for (const card of candidates) {
+            const cardText = (card.textContent || '').replace(/\s+/g, ' ').trim();
+            if (PRICE_RE.test(cardText)) {
+                debugNodes.push({text: cardText.slice(0, 200), html: card.outerHTML.slice(0, 500)});
+            }
+        }
+        return {__debug__: true, nodes: debugNodes};
     }
-    if (!cardEl) continue;
-    card = cardEl;
-
-    const cardText = (card.textContent || '').replace(/\\s+/g, ' ').trim();
-    const priceMatch = cardText.match(PRICE_RE);
-    const price = priceMatch ? ('Rs ' + priceMatch[1]) : '';
-    const qtyMatch = cardText.match(QTY_RE);
-    const quantity = qtyMatch ? qtyMatch[1] : '';
-
-    const buttonLabel = bestButtonLabel(card);
-    const lower = cardText.toLowerCase();
-    const outOfStock =
-      /notify me/i.test(buttonLabel) ||
-      /out of stock/.test(lower) ||
-      /sold out/.test(lower);
-    const inStock = !outOfStock && /\\badd\\b/i.test((buttonLabel + ' ' + cardText));
-
-    let image = '';
-    const productImg = Array.from(card.querySelectorAll('img')).find(isProductImage);
-    if (productImg) {
-      image = productImg.currentSrc || productImg.src || productImg.getAttribute('data-src') || '';
-      if (!image && productImg.srcset) image = productImg.srcset.split(',')[0].trim().split(' ')[0];
-    }
-
-    const key = name + '|' + quantity + '|' + price;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    items.push({ store: 'blinkit', name, price, quantity, inStock, outOfStock, buttonLabel, image });
-  }
-  return items;
+    return items;
 })()
 """
 
@@ -656,8 +641,14 @@ def _safe_filename(s: str) -> str:
     return (s.strip("_")[:80]) or "item"
 
 
-def _classify_page(text: str) -> str:
+def _classify_page(text: str, products: list = None) -> str:
     t = (text or "").lower()
+    # If products found, never call it blocked/location-gated
+    if products and len(products) > 0:
+        return "ok"
+    # If price pattern found in HTML, don't call it blocked/location-gated
+    if re.search(r'(₹|rs\.?|inr)\s*[0-9][0-9,]*', t):
+        return "ok"
     if any(x in t for x in ["select your location", "detect my location", "choose delivery", "set your location"]):
         return "location-gated"
     if any(x in t for x in ["select location", "login/ sign up", "login / sign up"]):
@@ -753,11 +744,17 @@ def _scrape_store_products(page, store: str, keyword: str) -> tuple[list[dict], 
     products: list[dict] = []
     deadline = time.time() + 20.0
     attempt = 0
+    debug_nodes = None
     while time.time() < deadline:
         attempt += 1
         try:
             if store == "blinkit":
-                products = page.evaluate(_extraction_js(keyword))
+                result = page.evaluate(_extraction_js(keyword))
+                if (result and getattr(result, '__debug__', False)):
+                    debug_nodes = result['nodes']
+                    products = []
+                else:
+                    products = result
             else:
                 products = page.evaluate(_generic_extraction_js(store, keyword))
         except Exception as exc:
@@ -774,7 +771,20 @@ def _scrape_store_products(page, store: str, keyword: str) -> tuple[list[dict], 
         body_text = page.inner_text("body")
     except Exception:
         body_text = ""
-    classification = _classify_page(body_text)
+    # If debug_nodes present, log them for diagnosis
+    if debug_nodes is not None:
+        logging.warning("[%s/%s] Extraction debug nodes: %s", store, keyword, json.dumps(debug_nodes)[:1000])
+        # Save debug_nodes to debug folder
+        try:
+            root = Path(DEBUG_DIR)
+            root.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            folder = root / f"{ts}_{_safe_filename(store)}_{_safe_filename(keyword)}"
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "debug_nodes.json").write_text(json.dumps(debug_nodes, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logging.warning("[%s/%s] debug_nodes write failed: %s", store, keyword, exc)
+    classification = _classify_page(body_text, products)
 
     force_debug = RUN_ONCE and not products
     if not products:
