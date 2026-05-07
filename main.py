@@ -585,17 +585,15 @@ def send_telegram_media_group(
 # ---------------------------------------------------------------------------
 
 def _launch_browser(playwright):
-    chromium_path = shutil.which("chromium") or shutil.which("chromium-browser")
     launch_kwargs = {
         "headless": True,
+        "channel": "chrome",
         "args": [
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
         ],
     }
-    if chromium_path:
-        launch_kwargs["executable_path"] = chromium_path
     return playwright.chromium.launch(**launch_kwargs)
 
 
@@ -622,6 +620,12 @@ def _new_context(browser, store: str):
         geolocation={"latitude": loc["lat"], "longitude": loc["lon"]},
         permissions=["geolocation"],
     )
+
+    context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined
+        });
+    """)
 
     # Store-specific cookie injection (best-effort; some stores require UI flows).
     if store == "blinkit":
@@ -732,6 +736,9 @@ def _scrape_store_products(page, store: str, keyword: str) -> tuple[list[dict], 
     """Return (products, classification)."""
     url = _store_search_url(store, keyword)
     try:
+        if store == "instamart":
+            page.goto("https://www.swiggy.com/instamart", wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2000)
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
     except PWTimeout:
         logging.warning("[%s/%s] page timed out on initial load; continuing.", store, keyword)
